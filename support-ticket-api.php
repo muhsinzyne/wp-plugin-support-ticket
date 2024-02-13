@@ -9,28 +9,6 @@
 **/
 
 // for migration for the access token
-
-function create_key_table()
-{
-    global $wpdb;
-
-    $table_name = $wpdb->prefix . 'support_access_tokens';
-
-    $charset_collate = $wpdb->get_charset_collate();
-
-    $sql = "CREATE TABLE $table_name (
-        id mediumint(9) NOT NULL AUTO_INCREMENT,
-        app_name VARCHAR(255) NOT NULL,
-        public_key TEXT NOT NULL,
-        private_key TEXT NOT NULL,
-        PRIMARY KEY  (id)
-    ) $charset_collate;";
-
-    require_once ABSPATH . 'wp-admin/includes/upgrade.php';
-    dbDelta($sql);
-}
-
-// api end points register routes
 function custom_rest_api_endpoint()
 {
     // Register a route to retrieve department data
@@ -69,82 +47,119 @@ function custom_rest_api_endpoint()
         'callback' => 'get_my_dashboard',
     ]);
 
-    register_rest_route('support-form', '/getattachment', [
+    register_rest_route('support-form', '/download', [
         'methods'  => 'GET',
-        'callback' => 'get_attachment',
+        'callback' => 'download',
     ]);
 }
 
-function get_ticket_reply_attachments($ticketId, $replayId)
+function download($data)
 {
-    global $wpdb;
-    $ticketId                 = $wpdb->escape($ticketId);
-    $replayId                 = $wpdb->escape($replayId);
-    $table_name               = $wpdb->prefix . 'js_ticket_attachments';
-    $query                    = $wpdb->prepare(
-        "SELECT * FROM $table_name WHERE ticketid = %d AND replyattachmentid = %d",
-        $ticketId,
-        $replayId,
-    );
-    $attachments                  = $wpdb->get_results($query);
+    $id   = $data['id'] ?? null;
+    $type = $data['type'] ?? null;
 
-    echo '<pre>';
-    print_r($attachments);
-    echo '</pre>';
-    die();
-    $upload_dir = wp_upload_dir();
-    $base_dir   = $upload_dir['basedir'];
-    $base_url   = $upload_dir['baseurl'];
-    $attachList = [];
-    foreach ($attachments as $key => $attach) {
-        $attach = (array) $attach;
-        // Extract the year and month from the creation date
-        $created_date = new DateTime($attach['created']);
-        $year         = $created_date->format('Y');
-        $month        = $created_date->format('m');
-        // Construct the file path
-        $file_path = $base_dir . '/' . $year . '/' . $month . '/' . $attach['filename'];
-        if (file_exists($file_path)) {
-            // Construct the URL to access the file
-            $file_url     = $base_url . '/' . $year . '/' . $month . '/' . $attach['filename'];
-            $attachList[] = $file_url;
+    $download   = true;
+
+    if ($type != null && $id != null) {
+        if ($type == 'all') {
+            if (!class_exists('PclZip')) {
+                do_action('jssupportticket_load_wp_pcl_zip');
+            }
+            $ticketattachment = JSSTincluder::getJSModel('ticket')->getAttachmentByTicketId($id);
+            $path             = JSST_PLUGIN_PATH;
+            $path .= 'zipdownloads';
+            JSSTincluder::getJSModel('jssupportticket')->makeDir($path);
+            $randomfolder = getRandomFolderName($path);
+            $path .= '/' . $randomfolder;
+            JSSTincluder::getJSModel('jssupportticket')->makeDir($path);
+
+            $archive           = new PclZip($path . '/alldownloads.zip');
+
+            $datadirectory     = jssupportticket::$_config['data_directory'];
+            $maindir           = wp_upload_dir();
+            $jpath             = $maindir['basedir'];
+            $jpath             = $jpath . '/' . $datadirectory;
+            $scanned_directory = [];
+
+            foreach ($ticketattachment as $ticketattachments) {
+                $directory = $jpath . '/attachmentdata/ticket/' . $ticketattachments->attachmentdir . '/';
+                // $scanned_directory = array_diff(scandir($directory), array('..', '.'));
+                array_push($scanned_directory, $ticketattachments->filename);
+            }
+            $filelist = '';
+            foreach ($scanned_directory as $file) {
+                $filelist .= $directory . '/' . $file . ',';
+            }
+
+            $filelist = jssupportticketphplib::JSST_substr($filelist, 0, jssupportticketphplib::JSST_strlen($filelist) - 1);
+            $v_list   = $archive->create($filelist, PCLZIP_OPT_REMOVE_PATH, $directory);
+
+            if ($v_list == 0) {
+                die("Error : '" . $archive->errorInfo() . "'");
+            }
+            $file = $path . '/alldownloads.zip';
+
+            header('Content-Description: File Transfer');
+            header('Content-Type: application/octet-stream');
+            header('Content-Disposition: attachment; filename=' . jssupportticketphplib::JSST_basename($file));
+            header('Content-Transfer-Encoding: binary');
+            header('Expires: 0');
+            header('Cache-Control: must-revalidate, post-check=0, pre-check=0');
+            header('Pragma: public');
+            header('Content-Length: ' . filesize($file));
+            //ob_clean();
+            flush();
+            readfile($file);
+            @unlink($file);
+            $path = JSST_PLUGIN_PATH;
+            $path .= 'zipdownloads';
+            $path .= '/' . $randomfolder;
+            @unlink($path . '/index.html');
+            if (file_exists($path)) {
+                rmdir($path);
+            }
+        }
+        if ($type == 'byid') {
+            if (!is_numeric($id)) {
+                return false;
+            }
+            $query = 'SELECT ticket.attachmentdir AS foldername,ticket.id AS ticketid,attach.filename  '
+                    . ' FROM `' . jssupportticket::$_db->prefix . 'js_ticket_attachments` AS attach '
+                    . ' JOIN `' . jssupportticket::$_db->prefix . 'js_ticket_tickets` AS ticket ON ticket.id = attach.ticketid '
+                    . ' WHERE attach.id = ' . esc_sql($id);
+            $object     = jssupportticket::$_db->get_row($query);
+            $foldername = $object->foldername;
+            $ticketid   = $object->ticketid;
+            $filename   = $object->filename;
+
+            if ($download == true) {
+                $datadirectory = jssupportticket::$_config['data_directory'];
+                $maindir       = wp_upload_dir();
+                $path          = $maindir['basedir'];
+                $path          = $path . '/' . $datadirectory;
+                $path          = $path . '/attachmentdata';
+                $path          = $path . '/ticket/' . $foldername;
+                $file          = $path . '/' . $filename;
+
+                header('Content-Description: File Transfer');
+                header('Content-Type: application/octet-stream');
+                header('Content-Disposition: attachment; filename=' . jssupportticketphplib::JSST_basename($file));
+                header('Content-Transfer-Encoding: binary');
+                header('Expires: 0');
+                header('Cache-Control: must-revalidate, post-check=0, pre-check=0');
+                header('Pragma: public');
+                header('Content-Length: ' . filesize($file));
+                //ob_clean();
+                flush();
+                readfile($file);
+                exit();
+            }
+        }
+        if ($type == 'byreplyid') {
         }
     }
-
-    return $attachList;
-}
-
-function get_ticket_attachments($ticketId)
-{
-    global $wpdb;
-    $id                       = $wpdb->escape($ticketId);
-    $table_name               = $wpdb->prefix . 'js_ticket_attachments';
-    $query                    = $wpdb->prepare(
-        "SELECT * FROM $table_name WHERE ticketid = %d AND replyattachmentid = %d",
-        $id,
-        0
-    );
-    $attachments                  = $wpdb->get_results($query);
-    $upload_dir                   = wp_upload_dir();
-    $base_dir                     = $upload_dir['basedir'];
-    $base_url                     = $upload_dir['baseurl'];
-    $attachList                   = [];
-    foreach ($attachments as $key => $attach) {
-        $attach = (array) $attach;
-        // Extract the year and month from the creation date
-        $created_date = new DateTime($attach['created']);
-        $year         = $created_date->format('Y');
-        $month        = $created_date->format('m');
-        // Construct the file path
-        $file_path = $base_dir . '/' . $year . '/' . $month . '/' . $attach['filename'];
-        if (file_exists($file_path)) {
-            // Construct the URL to access the file
-            $file_url     = $base_url . '/' . $year . '/' . $month . '/' . $attach['filename'];
-            $attachList[] = $file_url;
-        }
+    if ($id != null) {
     }
-
-    return $attachList;
 }
 
 function get_ticket_details($data)
@@ -167,7 +182,25 @@ function get_ticket_details($data)
     );
     $ticket = $wpdb->get_row($query, ARRAY_A);
 
-    $ticket['attachments'] = get_ticket_attachments($ticket['id']);
+    if (!$ticket) {
+        $response = new WP_REST_Response(['message' => 'No Ticket Found'], 404);
+
+        return rest_ensure_response($response);
+    }
+
+    $attachmenttable               = $wpdb->prefix . 'js_ticket_attachments';
+    $query                         = $wpdb->prepare(
+        "SELECT * FROM $attachmenttable WHERE ticketid = %d AND replyattachmentid = %d",
+        $ticket['id'],
+        0,
+    );
+
+    $attachementList                      = [];
+    $attachmentsResponse                  = $wpdb->get_results($query);
+    foreach ($attachmentsResponse as $key => $item) {
+        // code...
+        $ticket['attachments'][] = (array) $item;
+    }
 
     $table_replay               = $wpdb->prefix . 'js_ticket_replies';
 
@@ -179,45 +212,23 @@ function get_ticket_details($data)
     $ticketReply                  = $wpdb->get_results($ticketReplysQuery);
     $replyFormatted               = [];
     foreach ($ticketReply as $key => $reply) {
+        $query                         = $wpdb->prepare(
+            "SELECT * FROM $attachmenttable WHERE ticketid = %d AND replyattachmentid = %d",
+            $ticket['id'],
+            $reply->id,
+        );
+
+        $replyAttachmentResponse                  = $wpdb->get_results($query);
+
         $reply                               = (array) $reply;
         $replyFormatted[$key]                = $reply;
-        $replyFormatted[$key]['attachments'] =  get_ticket_reply_attachments($reply['ticketid'], $reply['id']);
+        $replyFormatted[$key]['attachments'] = $replyAttachmentResponse;
         // code...
     }
 
-    echo '<pre>';
-    print_r($replyFormatted);
-    echo '</pre>';
-    die();
-}
+    $ticket['replayList'] = $replyFormatted;
 
-function get_attachment($data)
-{
-    $validate = auth_validate_me();
-    if (!$validate) {
-        $response = new WP_REST_Response(['message' => 'UNAUTHORIZED'], 401);
-
-        return rest_ensure_response($response);
-    }
-    global $wpdb;
-
-    $id = isset($data['id']) ? $data['id'] : null;
-
-    $id = $wpdb->escape($id);
-
-    if ($id == null) {
-        $response = new WP_REST_Response(['message' => 'image not availabe'], 404);
-
-        return rest_ensure_response($response);
-    } else {
-        $table_name               = $wpdb->prefix . 'js_ticket_attachments';
-
-        $query = $wpdb->prepare(
-            "SELECT * FROM $table_name WHERE id = %d",
-            $id
-        );
-        $result = $wpdb->get_row($query, ARRAY_A);
-    }
+    return rest_ensure_response($ticket);
 }
 
 function get_my_dashboard($data)
@@ -540,4 +551,139 @@ add_action('rest_api_init', 'custom_rest_api_endpoint');
 add_action('admin_menu', 'my_settings_accesstoken_generate_menu');
 
 // register hooks
-register_activation_hook(__FILE__, 'create_key_table');
+register_activation_hook(__FILE__, 'activation_functions');
+register_deactivation_hook(__FILE__, 'deactivation_functions');
+
+function activation_functions()
+{
+    $contents = file_get_contents(__DIR__ . '/plugin-overriders/formhandler.php');
+    $savedd   = file_put_contents(__DIR__ . '/../js-support-ticket/includes/formhandler.php', $contents);
+
+    create_key_table();
+}
+
+function create_key_table()
+{
+    global $wpdb;
+
+    $table_name = $wpdb->prefix . 'support_access_tokens';
+
+    $charset_collate = $wpdb->get_charset_collate();
+
+    $sql = "CREATE TABLE $table_name (
+        id mediumint(9) NOT NULL AUTO_INCREMENT,
+        app_name VARCHAR(255) NOT NULL,
+        public_key TEXT NOT NULL,
+        private_key TEXT NOT NULL,
+        PRIMARY KEY  (id)
+    ) $charset_collate;";
+
+    require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+    dbDelta($sql);
+}
+
+function deactivation_functions()
+{
+    $contents = file_get_contents(__DIR__ . '/plugin-stocks/formhandler.php');
+    $savedd   = file_put_contents(__DIR__ . '/../js-support-ticket/includes/formhandler.php', $contents);
+}
+
+function getRandomFolderName($path)
+{
+    $match = '';
+    do {
+        $rndfoldername = '';
+        $length        = 5;
+        $possible      = '2346789bcdfghjkmnpqrtvwxyzBCDFGHJKLMNPQRTVWXYZ';
+        $maxlength     = jssupportticketphplib::JSST_strlen($possible);
+        if ($length > $maxlength) {
+            $length = $maxlength;
+        }
+        $i = 0;
+        while ($i < $length) {
+            $char = jssupportticketphplib::JSST_substr($possible, mt_rand(0, $maxlength - 1), 1);
+            if (!strstr($rndfoldername, $char)) {
+                if ($i == 0) {
+                    if (ctype_alpha($char)) {
+                        $rndfoldername .= $char;
+                        $i++;
+                    }
+                } else {
+                    $rndfoldername .= $char;
+                    $i++;
+                }
+            }
+        }
+        $folderexist = $path . '/' . $rndfoldername;
+        if (file_exists($folderexist)) {
+            $match = 'Y';
+        } else {
+            $match = 'N';
+        }
+    } while ($match == 'Y');
+
+    return $rndfoldername;
+}
+
+class SupportTicketAPI
+{
+    private $ticketid;
+    private $articleid;
+    private $downloadid;
+    private $categoryid;
+    private $staffid;
+    private $uploadfor;
+
+    public function __construct()
+    {
+        // Hook into the 'upload_dir' filter provided by the original plugin
+        add_filter('upload_dir', [$this, 'jssupportticket_upload_dir']);
+    }
+
+    public function jssupportticket_upload_dir($dir)
+    {
+        $form_request = JSSTrequest::getVar('form_request');
+
+        $atValue = isset($_GET['api']) ? (JSSTrequest::getVar('api')) : false;
+
+        if ($form_request == 'jssupportticket' or $this->uploadfor == 'agent' || $atValue == true) {
+            $datadirectory = jssupportticket::$_config['data_directory'];
+            $path          = $datadirectory . '/attachmentdata';
+
+            $foldername = '';
+
+            if ($this->uploadfor == 'ticket') {
+                $path       = $path . '/ticket';
+                $query      = 'SELECT attachmentdir FROM `' . jssupportticket::$_db->prefix . 'js_ticket_tickets` WHERE id = ' . esc_sql($this->ticketid);
+                $foldername = jssupportticket::$_db->get_var($query);
+            } elseif ($this->uploadfor == 'article') {
+                $path = $path . '/articles/article_' . $this->articleid;
+            } elseif ($this->uploadfor == 'download') {
+                $path = $path . '/downloads/download_' . $this->downloadid;
+            } elseif ($this->uploadfor == 'category') {
+                $path = $datadirectory . '/knowledgebasedata/categories/category_' . $this->categoryid;
+            } elseif ($this->uploadfor == 'agent') {
+                $path = $datadirectory . '/staffdata/staff_' . $this->staffid;
+            }
+
+            $userpath = $path . '/' . $foldername;
+
+            $array = [
+                'path'   => $dir['basedir'] . '/' . $userpath,
+                'url'    => $dir['baseurl'] . '/' . $userpath,
+                'subdir' => '/' . $userpath,
+            ] + $dir;
+
+            return $array;
+        } elseif ($this->uploadfor == 'notificationlogo') {
+            $datadirectory = jssupportticket::$_config['data_directory'];
+            $path          = $datadirectory;
+
+            return $path;
+        } else {
+            return $dir;
+        }
+    }
+}
+
+$api = new SupportTicketAPI();
